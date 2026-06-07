@@ -9,10 +9,11 @@ No telemetry. No config files. Pure Python stdlib — optional deps add accuracy
 ## How it works
 
 1. Scans your project and scores every file by importance (git recency, commit churn, depth, name, prompt keywords)
-2. Strips noise — JSDoc blocks, docstrings, import statements — before packing
-3. Summarises config files (`package.json`, `tsconfig.json`) as compact one-liners
-4. Writes `CLAUDE_CONTEXT.md` with a project summary, architecture map, file tree with token counts, and file contents
-5. Optionally launches Claude Code with the context already loaded
+2. Scans file content for accidentally committed secrets — warns and redacts before packing
+3. Strips noise — JSDoc blocks, docstrings, import statements — before packing
+4. Summarises config files (`package.json`, `tsconfig.json`) as compact one-liners
+5. Writes `CLAUDE_CONTEXT.md` with a project summary, architecture map, file tree with per-file token counts, and file contents
+6. Optionally launches Claude Code with the context already loaded
 
 Claude reads the file at session start instead of spending 5–10 turns exploring your codebase.
 
@@ -59,7 +60,6 @@ dgc
 ```bash
 # Interactive — scans and asks what to do
 dgc
-python dgc.py
 
 # Just create CLAUDE_CONTEXT.md
 dgc --context-only
@@ -69,6 +69,13 @@ dgc --launch
 
 # Create context + launch Claude with a starting prompt
 dgc --launch "fix the login bug"
+
+# Preview what would be packed — no files written
+dgc --dry-run
+
+# Token breakdown by folder after packing
+dgc --stats
+dgc --context-only --stats
 
 # Only repack files changed since last run
 dgc --refresh
@@ -81,7 +88,7 @@ dgc --focus src/api --launch "add rate limiting"
 # Exclude patterns (repeatable, glob syntax)
 dgc --exclude "**/*.test.ts" --exclude "DOC/" --exclude "**/*.spec.*"
 
-# Balance folder representation (--diverse mode)
+# Balance folder representation
 dgc --diverse
 
 # Auto-regenerate context whenever files change
@@ -98,14 +105,82 @@ Running with no flags asks before writing anything:
 ```
 [dgc] Scanning git-bloom...
 [dgc] Using: tiktoken, pathspec, watchdog, .gitignore
-[dgc] Git: 12 recently changed files prioritised
-[dgc] Keywords: login, auth
 
 What would you like to do?
   1) Just create the context file
   2) Create the context file + launch Claude Code
 Enter 1 or 2:
 ```
+
+---
+
+## Secret scanning
+
+Before packing any file, dgc scans its content for common credential patterns:
+
+| Pattern | Example |
+|---|---|
+| OpenAI key | `sk-...` |
+| GitHub token | `ghp_...` |
+| AWS access key | `AKIA...` |
+| Private key header | `-----BEGIN ... PRIVATE KEY-----` |
+| Generic API key | `api_key = "..."` |
+| Generic secret | `password = "..."` |
+| DB connection string | `postgres://user:pass@...` |
+
+When a match is found:
+```
+[dgc] ⚠ Possible secret in login.ts: GitHub token, Generic secret
+```
+
+The matched content is **redacted** in the packed output — Claude sees `[REDACTED:GitHub token]` instead of the actual value. The original file is never modified.
+
+`.env` files and their variants (`.env.local`, `.env.production`, etc.) are excluded entirely and never packed.
+
+---
+
+## Dry run
+
+Preview exactly what would be packed and how many tokens it would use — without writing anything:
+
+```bash
+dgc --dry-run
+```
+
+```
+[dgc] Dry run — 38 files would be packed:
+  src/reducers/game-reducer.ts  (~240 tokens)
+  src/routes/index.tsx          (~180 tokens)
+  src/lib/constants.ts          (~310 tokens)
+  ...
+
+[dgc] Estimated total: ~9,240 tokens
+[dgc] No files written.
+```
+
+Useful for tuning `--focus` and `--exclude` before committing to a scan.
+
+---
+
+## Stats mode
+
+After packing, print a token breakdown by folder:
+
+```bash
+dgc --stats
+dgc --context-only --stats
+```
+
+```
+[dgc] Token usage by folder:
+  src/reducers                        3,240 tokens   18%  ██████
+  src/components                      2,890 tokens   16%  █████
+  src/lib                             1,200 tokens    7%  ██
+  src/routes                            980 tokens    5%  █
+  (root)                                420 tokens    2%  █
+```
+
+Helps you decide where to `--focus` or `--exclude` on the next run.
 
 ---
 
@@ -133,7 +208,7 @@ Removed from every file before packing:
 | Language | Stripped |
 |---|---|
 | TypeScript / JavaScript | `import` statements, JSDoc `/** */` blocks |
-| Python | `import`/`from` statements, docstrings (AST-based, regex fallback) |
+| Python | `import`/`from` statements, docstrings (AST-based, regex fallback on syntax error) |
 | Go | `import` blocks (single and grouped) |
 | Rust | `use` statements |
 | Java / Kotlin | `import` statements |
@@ -160,15 +235,11 @@ Diffs the current file set against the last session using BLAKE2b hashes:
 - **Added** — file is new since last run
 - **Removed** — file was in last session, no longer on disk
 
-Output:
 ```
 [dgc] Refresh: 3 modified, 1 added, 2 removed
 ```
 
-Removed files appear in `CLAUDE_CONTEXT.md` under `## Removed Files` so Claude knows what's gone.
-Unchanged files are listed under `## Unchanged` and excluded from the packed content.
-
-Session state is stored in `.dgc-session.json`.
+Removed files appear in `CLAUDE_CONTEXT.md` under `## Removed Files` so Claude knows what's gone. Unchanged files are listed under `## Unchanged` and excluded from packed content.
 
 ---
 
@@ -180,27 +251,14 @@ dgc --watch
 
 Regenerates `CLAUDE_CONTEXT.md` automatically on file changes.
 
-- With `watchdog`: event-driven + a 30-second periodic rescan to catch new and deleted files that events can miss
-- Without `watchdog`: full rescan every 2 seconds (catches all change types including new/deleted)
+- With `watchdog`: event-driven + 30-second periodic rescan to catch new and deleted files
+- Without `watchdog`: full rescan every 2 seconds (catches all change types)
 
 ```
 [dgc] Watch mode active. Ctrl+C to stop.
-[dgc] Using watchdog (+ 30s rescan for new/deleted files).
 [dgc] Regenerated — 38 files, ~9,200 tokens (14:23:01)
 [dgc] Regenerated — 39 files, ~9,350 tokens (14:25:44)
 ```
-
----
-
-## Diverse mode
-
-```bash
-dgc --diverse
-```
-
-Caps files per directory at 5 before lower-scoring directories get slots. Useful for large monorepos where one hot folder would otherwise dominate the context.
-
-Not recommended for typical projects — the scoring system already handles relevance well.
 
 ---
 
@@ -209,8 +267,6 @@ Not recommended for typical projects — the scoring system already handles rele
 Create `CLAUDE_NOTES.md` in your project root. Injected into every context automatically.
 
 ```markdown
-# CLAUDE_NOTES.md
-
 ## Architecture decisions
 - All state lives in useReducer + Context — no external state lib
 - Reducer handlers are split into individual files under src/reducers/
@@ -218,8 +274,18 @@ Create `CLAUDE_NOTES.md` in your project root. Injected into every context autom
 
 ## Known issues
 - handle-tick.ts: race condition when legacy plant dies on same tick as standup
-- PR queue desyncs after sprint reset — see issue #42
 ```
+
+---
+
+## Ignore files
+
+| File | Purpose |
+|---|---|
+| `.gitignore` | Read automatically — all patterns respected |
+| `.dgcignore` | dgc-specific excludes (same gitignore syntax) |
+
+The context file itself (`CLAUDE_CONTEXT.md`) and session file (`.dgc-session.json`) are always excluded.
 
 ---
 
@@ -238,8 +304,6 @@ echo "CLAUDE_CONTEXT.md" >> .gitignore
 echo ".dgc-session.json" >> .gitignore
 ```
 
-You can also create `.dgcignore` with additional patterns dgc should ignore (same gitignore syntax).
-
 ---
 
 ## vs RepoMix
@@ -247,13 +311,11 @@ You can also create `.dgcignore` with additional patterns dgc should ignore (sam
 dgc is intentionally simpler and Claude Code-focused. RepoMix has more features if you need:
 
 - Tree-sitter AST compression (~70% token reduction)
-- Secretlint content scanning
 - Remote GitHub repo packing by URL
 - MCP server mode
-- Per-folder token breakdowns
 - Output splitting for very large repos
 
-dgc advantages: no Node.js required, no install step, works anywhere Python 3.10+ runs, integrates directly with Claude Code launch.
+dgc advantages: no Node.js required, no install step, works anywhere Python 3.10+ runs, secret scanning with redaction, integrates directly with Claude Code launch.
 
 ---
 
