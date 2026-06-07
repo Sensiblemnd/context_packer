@@ -2,36 +2,39 @@
 
 Pack your codebase into a single `CLAUDE_CONTEXT.md` so Claude Code spends tokens **solving problems, not exploring files**. Saves ~30–40% tokens per session.
 
-No telemetry. No config files. No dependencies beyond Python stdlib.
+No telemetry. No config files. Pure Python stdlib — optional deps add accuracy.
 
 ---
 
 ## How it works
 
-1. Scans your project and scores every file by importance (git recency, churn frequency, depth, name, prompt keywords)
+1. Scans your project and scores every file by importance (git recency, commit churn, depth, name, prompt keywords)
 2. Strips noise — JSDoc blocks, docstrings, import statements — before packing
 3. Summarises config files (`package.json`, `tsconfig.json`) as compact one-liners
-4. Writes a single `CLAUDE_CONTEXT.md` with a project summary, architecture inference, file tree, and file contents
+4. Writes `CLAUDE_CONTEXT.md` with a project summary, architecture map, file tree with token counts, and file contents
 5. Optionally launches Claude Code with the context already loaded
 
-Claude reads the file at session start instead of spending 5–10 turns calling `read_file` to explore your codebase.
+Claude reads the file at session start instead of spending 5–10 turns exploring your codebase.
 
 ---
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — `npm install -g @anthropic-ai/claude-code`
-- Git (optional — improves file scoring)
+- Git (optional — improves file scoring significantly)
 
 **Optional — install for best results:**
 
 ```bash
-pip install tiktoken watchdog
+pip install tiktoken watchdog pathspec
 ```
 
-- `tiktoken` — accurate token counting (falls back to `chars / 4` without it)
-- `watchdog` — efficient file-system events in `--watch` mode (falls back to polling)
+| Package | Effect |
+|---|---|
+| `tiktoken` | Accurate token counting (falls back to `chars / 4`) |
+| `watchdog` | Efficient file-system events in `--watch` mode (falls back to polling) |
+| `pathspec` | Reads your `.gitignore` and `.dgcignore` (falls back to built-in skip list) |
 
 ---
 
@@ -58,7 +61,7 @@ dgc
 dgc
 python dgc.py
 
-# Just create CLAUDE_CONTEXT.md, don't launch Claude
+# Just create CLAUDE_CONTEXT.md
 dgc --context-only
 
 # Create context + launch Claude
@@ -67,13 +70,19 @@ dgc --launch
 # Create context + launch Claude with a starting prompt
 dgc --launch "fix the login bug"
 
-# Only repack files that changed since last run
+# Only repack files changed since last run
 dgc --refresh
 dgc --refresh --launch
 
 # Only pack a specific subfolder
 dgc --focus src/reducers
 dgc --focus src/api --launch "add rate limiting"
+
+# Exclude patterns (repeatable, glob syntax)
+dgc --exclude "**/*.test.ts" --exclude "DOC/" --exclude "**/*.spec.*"
+
+# Balance folder representation (--diverse mode)
+dgc --diverse
 
 # Auto-regenerate context whenever files change
 dgc --watch
@@ -88,6 +97,7 @@ Running with no flags asks before writing anything:
 
 ```
 [dgc] Scanning git-bloom...
+[dgc] Using: tiktoken, pathspec, watchdog, .gitignore
 [dgc] Git: 12 recently changed files prioritised
 [dgc] Keywords: login, auth
 
@@ -101,7 +111,7 @@ Enter 1 or 2:
 
 ## File scoring
 
-Files are ranked — higher score means included first and more likely to stay within the token budget:
+Files are ranked — higher score = included first and within token budget:
 
 | Signal | Score |
 |---|---|
@@ -120,15 +130,15 @@ Files are ranked — higher score means included first and more likely to stay w
 
 Removed from every file before packing:
 
-| Language | What's stripped |
+| Language | Stripped |
 |---|---|
 | TypeScript / JavaScript | `import` statements, JSDoc `/** */` blocks |
-| Python | `import` / `from` statements, triple-quoted docstrings (AST-based) |
+| Python | `import`/`from` statements, docstrings (AST-based, regex fallback) |
 | Go | `import` blocks (single and grouped) |
 | Rust | `use` statements |
 | Java / Kotlin | `import` statements |
 | C# | `using` statements |
-| All | Excess blank lines collapsed to max 2 |
+| All | Excess blank lines collapsed |
 
 Config files are summarised rather than included in full:
 
@@ -138,11 +148,27 @@ Config files are summarised rather than included in full:
 
 ---
 
-## Session memory & refresh mode
+## Refresh mode
 
-After each run, dgc saves `.dgc-session.json` with a hash of every packed file.
+```bash
+dgc --refresh
+```
 
-On the next run, `--refresh` compares current hashes against the session and only repacks files that changed — skipping unchanged files entirely and listing them in the context as "unchanged". Useful mid-session when you've only touched a few files.
+Diffs the current file set against the last session using BLAKE2b hashes:
+
+- **Modified** — file exists, hash changed
+- **Added** — file is new since last run
+- **Removed** — file was in last session, no longer on disk
+
+Output:
+```
+[dgc] Refresh: 3 modified, 1 added, 2 removed
+```
+
+Removed files appear in `CLAUDE_CONTEXT.md` under `## Removed Files` so Claude knows what's gone.
+Unchanged files are listed under `## Unchanged` and excluded from the packed content.
+
+Session state is stored in `.dgc-session.json`.
 
 ---
 
@@ -152,20 +178,35 @@ On the next run, `--refresh` compares current hashes against the session and onl
 dgc --watch
 ```
 
-Regenerates `CLAUDE_CONTEXT.md` automatically whenever files change. Uses `watchdog` for efficient file-system events if installed, otherwise polls every 2 seconds.
+Regenerates `CLAUDE_CONTEXT.md` automatically on file changes.
+
+- With `watchdog`: event-driven + a 30-second periodic rescan to catch new and deleted files that events can miss
+- Without `watchdog`: full rescan every 2 seconds (catches all change types including new/deleted)
 
 ```
 [dgc] Watch mode active. Ctrl+C to stop.
-[dgc] Using watchdog for efficient file-system events.
+[dgc] Using watchdog (+ 30s rescan for new/deleted files).
 [dgc] Regenerated — 38 files, ~9,200 tokens (14:23:01)
-[dgc] Regenerated — 38 files, ~9,240 tokens (14:25:44)
+[dgc] Regenerated — 39 files, ~9,350 tokens (14:25:44)
 ```
+
+---
+
+## Diverse mode
+
+```bash
+dgc --diverse
+```
+
+Caps files per directory at 5 before lower-scoring directories get slots. Useful for large monorepos where one hot folder would otherwise dominate the context.
+
+Not recommended for typical projects — the scoring system already handles relevance well.
 
 ---
 
 ## Persistent notes
 
-Create `CLAUDE_NOTES.md` in your project root. It gets injected into every context file automatically — use it for anything you always want Claude to know about the project.
+Create `CLAUDE_NOTES.md` in your project root. Injected into every context automatically.
 
 ```markdown
 # CLAUDE_NOTES.md
@@ -173,11 +214,11 @@ Create `CLAUDE_NOTES.md` in your project root. It gets injected into every conte
 ## Architecture decisions
 - All state lives in useReducer + Context — no external state lib
 - Reducer handlers are split into individual files under src/reducers/
-- pnpm only — npm is blocked by engine config
+- pnpm only — npm is blocked via engine config
 
 ## Known issues
 - handle-tick.ts: race condition when legacy plant dies on same tick as standup
-- PR queue sometimes desyncs after sprint reset
+- PR queue desyncs after sprint reset — see issue #42
 ```
 
 ---
@@ -187,31 +228,32 @@ Create `CLAUDE_NOTES.md` in your project root. It gets injected into every conte
 | File | Description |
 |---|---|
 | `CLAUDE_CONTEXT.md` | Generated — read by Claude at session start |
-| `CLAUDE_NOTES.md` | Yours to edit — injected into every context |
-| `.dgc-session.json` | Session cache used by `--refresh` |
+| `CLAUDE_NOTES.md` | Your persistent notes — edit manually |
+| `.dgc-session.json` | Session cache for `--refresh` (BLAKE2b hashes) |
 
-Add the generated files to `.gitignore`:
+Add generated files to `.gitignore`:
 
 ```bash
 echo "CLAUDE_CONTEXT.md" >> .gitignore
 echo ".dgc-session.json" >> .gitignore
 ```
 
+You can also create `.dgcignore` with additional patterns dgc should ignore (same gitignore syntax).
+
 ---
 
 ## vs RepoMix
 
-dgc is intentionally simpler and Claude Code-focused. RepoMix is the more fully-featured tool if you need:
+dgc is intentionally simpler and Claude Code-focused. RepoMix has more features if you need:
 
 - Tree-sitter AST compression (~70% token reduction)
-- Secretlint secret scanning on file contents
-- `.gitignore` / `.repomixignore` file respect
+- Secretlint content scanning
 - Remote GitHub repo packing by URL
 - MCP server mode
-- Per-file token counts in the tree
+- Per-folder token breakdowns
 - Output splitting for very large repos
 
-dgc's advantages: no Node.js required, no install step, works anywhere Python runs, directly integrates with Claude Code launch.
+dgc advantages: no Node.js required, no install step, works anywhere Python 3.10+ runs, integrates directly with Claude Code launch.
 
 ---
 
