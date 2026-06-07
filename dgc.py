@@ -12,6 +12,8 @@ Usage:
     python dgc.py --watch                                # regenerate on file changes
     python dgc.py --exclude "**/*.test.ts" --exclude DOC/  # exclude patterns
     python dgc.py --diverse                              # balance folder representation
+    python dgc.py --dry-run                              # preview without writing
+    python dgc.py --stats                                # token breakdown by folder
 
 Optional dependencies (pip install tiktoken watchdog pathspec):
     tiktoken  - accurate token counting instead of char/4 estimate
@@ -137,9 +139,14 @@ DIVERSE_DIR_CAP = 5
 # ── Data ───────────────────────────────────────────────────────────────────────
 @dataclass
 class ContextStats:
-    included: int = 0
-    omitted:  int = 0
-    tokens:   int = 0
+    included:    int = 0
+    omitted:     int = 0
+    tokens:      int = 0
+    folder_tokens: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.folder_tokens is None:
+            self.folder_tokens = {}
 
 
 @dataclass
@@ -403,6 +410,40 @@ def summarise_config(path: Path) -> str:
     return json.dumps(data, indent=2)[:400]
 
 
+# ── Secret scanning ──────────────────────────────────────────────────────────
+_SECRET_PATTERNS: list[tuple[str, re.Pattern]] | None = None
+
+def _get_secret_patterns() -> list[tuple[str, re.Pattern]]:
+    """Lazy-init secret patterns (avoids compiling regexes until needed)."""
+    global _SECRET_PATTERNS
+    if _SECRET_PATTERNS is None:
+        _SECRET_PATTERNS = [
+            ("OpenAI key",         re.compile(r"sk-[A-Za-z0-9]{20,}")),
+            ("GitHub token",       re.compile(r"ghp_[A-Za-z0-9]{36}")),
+            ("AWS access key",     re.compile(r"AKIA[0-9A-Z]{16}")),
+            ("Private key header", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
+            ("Generic API key",    re.compile(r"(?i)(?:api_key|apikey|api-key)\s*[=:]\s*[A-Za-z0-9_-]{16,}")),
+            ("Generic secret",     re.compile(r"(?i)(?:secret|password|passwd|token)\s*[=:]\s*[^\s]{8,}")),
+            ("DB connection",      re.compile(r"(?i)(?:postgres|mysql|mongodb)://\S+")),
+        ]
+    return _SECRET_PATTERNS
+
+
+def scan_secrets(path: Path, text: str) -> list[str]:
+    """
+    Scan file content for common secret patterns before packing.
+    Returns a list of warning strings. Empty = clean.
+    Skips binary-looking content and files already in SECRET_NAMES.
+    """
+    if path.name in SECRET_NAMES:
+        return []
+    warnings: list[str] = []
+    for label, pattern in _get_secret_patterns():
+        if pattern.search(text):
+            warnings.append(label)
+    return warnings
+
+
 # ── File reading ───────────────────────────────────────────────────────────────
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     """
@@ -432,6 +473,15 @@ def read_snippet(path: Path) -> tuple[str, int]:
         else:
             text = path.read_text(encoding="utf-8", errors="replace")
             text = strip_noise(text, path.suffix.lower())
+
+        # Secret scan — warn before packing, redact the match
+        secret_hits = scan_secrets(path, text)
+        if secret_hits:
+            rel = path.name
+            print(f"[dgc] ⚠ Possible secret in {rel}: {', '.join(secret_hits)}")
+            # Redact matched content so it does not reach Claude
+            for label, pattern in _get_secret_patterns():
+                text = pattern.sub(f"[REDACTED:{label}]", text)
 
         # Binary-search truncation — exact token guarantee
         text   = _truncate_to_tokens(text, MAX_FILE_TOKENS)
@@ -691,7 +741,9 @@ def auto_summary(
     arch      = [f"- `{k}/` — {v}" for k, v in ARCH_FOLDERS.items() if k in folders]
     proj_type = detect_project_type(root)
 
-    return "\n".join([
+    dgcignore_note = "- Create `.dgcignore` for additional per-project exclude patterns (gitignore syntax)" if not (root / ".dgcignore").exists() else ""
+    extras = [dgcignore_note] if dgcignore_note else []
+    return "\n".join(filter(None, [
         "## Project Summary",
         f"- **Name:** {root.name}",
         f"- **Type:** {proj_type}",
@@ -701,7 +753,11 @@ def auto_summary(
         "",
         "## Architecture",
         *(arch or ["- (architecture not inferred)"]),
-    ])
+        "",
+        "## Notes",
+        "- Edit `CLAUDE_NOTES.md` to add persistent session notes",
+        *extras,
+    ]))
 
 
 # ── Context builder ────────────────────────────────────────────────────────────
@@ -800,6 +856,9 @@ def build_context(
 
         stats.tokens   += file_tokens
         stats.included += 1
+        # Track folder-level token usage for --stats
+        folder = "/".join(f.relative_to(root).parts[:-1]) or "(root)"
+        stats.folder_tokens[folder] = stats.folder_tokens.get(folder, 0) + file_tokens
         ext = f.suffix.lstrip(".")
         lines += [f"## {rel}", f"```{ext}", snippet, "```", ""]
 
@@ -953,9 +1012,11 @@ def main() -> None:
     do_refresh   = "--refresh"       in args
     do_watch     = "--watch"         in args
     diverse      = "--diverse"        in args
+    do_dry_run   = "--dry-run"        in args
+    do_stats     = "--stats"          in args
     args = [
         a for a in args
-        if a not in ("--context-only", "--launch", "--refresh", "--watch", "--diverse")
+        if a not in ("--context-only", "--launch", "--refresh", "--watch", "--diverse", "--dry-run", "--stats")
     ]
 
     # --focus <folder>
@@ -1009,6 +1070,22 @@ def main() -> None:
     result  = scan_project(root, focus, prompt, gitignore, exclude_spec, raw_excludes, diverse)
     session = load_session(root) if do_refresh else {}
 
+    # --dry-run: preview without writing anything
+    if do_dry_run:
+        print()
+        print(f"[dgc] Dry run — {len(result.files)} files would be packed:")
+        # Read snippets to get accurate token counts
+        total_tokens = 0
+        for f in result.files:
+            _, tok = read_snippet(f)
+            total_tokens += tok
+            rel = f.relative_to(root).as_posix()
+            print(f"  {rel}  (~{tok} tokens)")
+        print()
+        print(f"[dgc] Estimated total: ~{total_tokens:,} tokens")
+        print(f"[dgc] No files written.")
+        return
+
     # Ask BEFORE writing (interactive mode only)
     choice = "1"
     if not context_only and not do_launch:
@@ -1036,6 +1113,18 @@ def main() -> None:
         print(f"[dgc] Tip: create {NOTES_FILE} for persistent per-project notes")
     else:
         print(f"[dgc] Notes injected from {NOTES_FILE}")
+
+    # --stats: token breakdown by folder
+    if do_stats and stats.folder_tokens:
+        print()
+        print("[dgc] Token usage by folder:")
+        sorted_folders = sorted(stats.folder_tokens.items(), key=lambda x: x[1], reverse=True)
+        for folder, tok in sorted_folders:
+            bar_width = int((tok / stats.tokens) * 30) if stats.tokens else 0
+            bar = "█" * bar_width
+            pct = int((tok / stats.tokens) * 100) if stats.tokens else 0
+            print(f"  {folder:<35} {tok:>5} tokens  {pct:>3}%  {bar}")
+        print()
 
     if context_only:
         print("[dgc] Done. Run 'claude' when ready.")
